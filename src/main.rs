@@ -34,6 +34,8 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_millis(1_200);
 const STARTUP_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_VALUE: &str = "PeripheralBatteryMonitor";
 const ALARM_SETTINGS_KEY: &str = r"Software\PeripheralBatteryMonitor\BatteryAlarms";
+const BATTERY_CACHE_KEY: &str = r"Software\PeripheralBatteryMonitor\BatteryCache";
+const MOUSE_ASLEEP_ERROR: &str = "mouse is asleep/offline; battery is not currently responding";
 
 enum UiEvent {
     Batteries(Result<Vec<Battery>, String>),
@@ -48,6 +50,7 @@ struct Battery {
     device_name: String,
     level: u8,
     charging: bool,
+    is_stale: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -136,15 +139,24 @@ impl TrayApp {
             Ok(batteries) if !batteries.is_empty() => {
                 for battery in &batteries {
                     self.register_device_alarm(battery);
-                    self.update_low_battery_alarm(battery);
+                    if !battery.is_stale {
+                        self.update_low_battery_alarm(battery);
+                    }
                 }
 
                 let lowest = batteries.iter().min_by_key(|battery| battery.level).unwrap();
                 let details = batteries
                     .iter()
                     .map(|battery| {
-                        let charge = if battery.charging { " · charging" } else { "" };
-                        format!("{}: {}%{}", battery.device_name, battery.level, charge)
+                        if battery.is_stale {
+                            format!(
+                                "{}: {}% (last known; mouse asleep/offline)",
+                                battery.device_name, battery.level
+                            )
+                        } else {
+                            let charge = if battery.charging { " · charging" } else { "" };
+                            format!("{}: {}%{}", battery.device_name, battery.level, charge)
+                        }
                     })
                     .collect::<Vec<_>>();
                 (
@@ -296,6 +308,35 @@ fn set_device_alarm_enabled(device_id: &str, enabled: bool) -> std::io::Result<(
     key.set_value(&alarm_registry_value_name(device_id), &u32::from(enabled))
 }
 
+fn battery_cache_key(device_id: &str) -> String {
+    format!(r"{}\{}", BATTERY_CACHE_KEY, alarm_registry_value_name(device_id))
+}
+
+fn load_cached_battery(device_id: &str, device_name: &str) -> Option<Battery> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let cache = hkcu.open_subkey(battery_cache_key(device_id)).ok()?;
+    let level = cache.get_value::<u32, _>("Level").ok()?.min(100) as u8;
+    let charging = cache.get_value::<u32, _>("Charging").unwrap_or(0) != 0;
+    let cached_name = cache
+        .get_value::<String, _>("DeviceName")
+        .unwrap_or_else(|_| device_name.to_owned());
+    Some(Battery {
+        device_id: device_id.to_owned(),
+        device_name: cached_name,
+        level,
+        charging,
+        is_stale: true,
+    })
+}
+
+fn store_cached_battery(battery: &Battery) -> std::io::Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (cache, _) = hkcu.create_subkey(battery_cache_key(&battery.device_id))?;
+    cache.set_value("Level", &u32::from(battery.level))?;
+    cache.set_value("Charging", &u32::from(battery.charging))?;
+    cache.set_value("DeviceName", &battery.device_name)
+}
+
 fn alarm_registry_value_name(device_id: &str) -> String {
     // Keep arbitrary HID serials/paths out of registry value names.
     let hash = device_id.as_bytes().iter().fold(0xcbf29ce484222325u64, |hash, byte| {
@@ -438,7 +479,7 @@ fn read_batteries() -> Result<Vec<Battery>, String> {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or("ScyRox wireless mouse")
             .to_owned();
-        match query_device(&device, device_name, device_id.clone()) {
+        match query_device(&device, device_name.clone(), device_id.clone()) {
             Ok(battery) => {
                 log_diagnostic(&format!(
                     "battery read succeeded: product {:04x}, usage page {:04x}, interface {}, level {}%, charging {}",
@@ -448,8 +489,36 @@ fn read_batteries() -> Result<Vec<Battery>, String> {
                     battery.level,
                     battery.charging
                 ));
+                if !battery.is_stale {
+                    if let Err(error) = store_cached_battery(&battery) {
+                        log_diagnostic(&format!("could not save battery cache: {error}"));
+                    }
+                }
                 connected_device_ids.insert(device_id);
                 batteries.push(battery);
+            }
+            Err(error) if error == MOUSE_ASLEEP_ERROR => {
+                log_diagnostic(&format!(
+                    "mouse asleep; checking cached battery: product {:04x}, HID page {:04x}, interface {}",
+                    info.product_id(),
+                    info.usage_page(),
+                    info.interface_number()
+                ));
+                last_error = error;
+                if let Some(cached) = load_cached_battery(&device_id, &device_name) {
+                    log_diagnostic(&format!(
+                        "showing cached battery: product {:04x}, level {}%",
+                        info.product_id(),
+                        cached.level
+                    ));
+                    connected_device_ids.insert(device_id);
+                    batteries.push(cached);
+                } else {
+                    log_diagnostic(&format!(
+                        "no cached battery for sleeping mouse: product {:04x}",
+                        info.product_id()
+                    ));
+                }
             }
             Err(error) => {
                 last_error = format!(
@@ -492,14 +561,22 @@ fn query_device(device: &HidDevice, device_name: String, device_id: String) -> R
     request(device, 1, Some(&init_data))?;
 
     let online = request(device, 3, None)?;
-    if online.get(5).copied() != Some(1) {
-        return Err("mouse is offline; wake it and reconnect".into());
-    }
+    let is_online = online.get(5).copied() == Some(1);
 
-    let response = request(device, 4, None)?;
+    let response = match request(device, 4, None) {
+        Ok(response) => response,
+        Err(_) if !is_online => return Err(MOUSE_ASLEEP_ERROR.into()),
+        Err(error) => return Err(error),
+    };
     let level = response.get(5).copied().ok_or("short battery response")?.min(100);
     let charging = response.get(6).copied().ok_or("short battery response")? == 1;
-    Ok(Battery { device_id, device_name, level, charging })
+    Ok(Battery {
+        device_id,
+        device_name,
+        level,
+        charging,
+        is_stale: !is_online,
+    })
 }
 
 fn request(device: &HidDevice, command: u8, data: Option<&[u8]>) -> Result<Vec<u8>, String> {
