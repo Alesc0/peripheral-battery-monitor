@@ -1,0 +1,32 @@
+name: Build Windows portable executable
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build x64 executable
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build portable executable
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: peripheral-battery-monitor-windows-x64
+          path: target/x86_64-pc-windows-msvc/release/peripheral-battery-monitor.exe
+          if-no-files-found: error
+          retention-days: 90
