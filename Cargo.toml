@@ -1,0 +1,19 @@
+[package]
+name = "peripheral-battery-monitor"
+version = "0.1.0"
+edition = "2024"
+description = "Windows system tray battery monitor for supported peripherals"
+
+[dependencies]
+hidapi = { version = "2.6.7", default-features = false, features = ["windows-native"] }
+getrandom = "0.3"
+tray-icon = "0.26.1"
+winit = "0.30.12"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
