@@ -245,11 +245,23 @@ fn read_battery() -> Result<Battery, String> {
         if info.vendor_id() != VENDOR_ID || !WIRELESS_PRODUCT_IDS.contains(&info.product_id()) {
             continue;
         }
+        // Composite receivers also expose keyboard/mouse system collections.
+        // Windows may open those read-only, so sending vendor commands to them
+        // produces misleading access-denied errors. The ScyRox protocol lives
+        // on its vendor-defined HID collections.
+        if info.usage_page() < 0xff00 {
+            continue;
+        }
 
         let device = match api.open_path(info.path()) {
             Ok(device) => device,
             Err(error) => {
-                last_error = format_hid_error("could not open compatible receiver", error);
+                last_error = format!(
+                    "{} (HID page {:04x}, interface {})",
+                    format_hid_error("could not open vendor receiver", error),
+                    info.usage_page(),
+                    info.interface_number()
+                );
                 continue;
             }
         };
@@ -261,7 +273,13 @@ fn read_battery() -> Result<Battery, String> {
             .to_owned();
         match query_device(&device, device_name) {
             Ok(battery) => return Ok(battery),
-            Err(error) => last_error = error,
+            Err(error) => {
+                last_error = format!(
+                    "{error} (HID page {:04x}, interface {})",
+                    info.usage_page(),
+                    info.interface_number()
+                )
+            }
         }
     }
 
