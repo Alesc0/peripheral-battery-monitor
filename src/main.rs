@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use hidapi::{HidApi, HidDevice};
+use hidapi::{HidApi, HidDevice, HidError};
 use std::{
     error::Error,
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
@@ -21,6 +21,10 @@ const VENDOR_ID: u16 = 0x3554;
 const WIRELESS_PRODUCT_IDS: [u16; 3] = [0xf5f4, 0xf5f7, 0xf517];
 const HID_REPORT_ID: u8 = 8;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const ACCESS_DENIED_RETRY_DELAYS: [Duration; 2] = [
+    Duration::from_millis(250),
+    Duration::from_millis(750),
+];
 const RESPONSE_TIMEOUT: Duration = Duration::from_millis(1_200);
 const STARTUP_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_VALUE: &str = "PeripheralBatteryMonitor";
@@ -210,9 +214,27 @@ fn poll_worker(proxy: EventLoopProxy<UiEvent>, commands: Receiver<Command>) {
         }
         first_poll = false;
 
-        let result = read_battery();
+        let result = read_battery_with_retry();
         let _ = proxy.send_event(UiEvent::Battery(result));
     }
+}
+
+fn read_battery_with_retry() -> Result<Battery, String> {
+    for delay in ACCESS_DENIED_RETRY_DELAYS {
+        match read_battery() {
+            Err(message) if message.contains("[ACCESS_DENIED]") => thread::sleep(delay),
+            result => return result,
+        }
+    }
+
+    read_battery().map_err(|message| {
+        if message.contains("[ACCESS_DENIED]") {
+            "Windows denied access to the mouse receiver. Close ScyRox or other mouse software, then choose Refresh battery."
+                .to_string()
+        } else {
+            message
+        }
+    })
 }
 
 fn read_battery() -> Result<Battery, String> {
@@ -227,7 +249,7 @@ fn read_battery() -> Result<Battery, String> {
         let device = match api.open_path(info.path()) {
             Ok(device) => device,
             Err(error) => {
-                last_error = format!("could not open compatible receiver: {error}");
+                last_error = format_hid_error("could not open compatible receiver", error);
                 continue;
             }
         };
@@ -277,18 +299,31 @@ fn request(device: &HidDevice, command: u8, data: Option<&[u8]>) -> Result<Vec<u
     let checksum = 85u8.wrapping_sub(report[1..16].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)));
     report[16] = checksum.wrapping_sub(HID_REPORT_ID);
 
-    device.write(&report).map_err(|error| format!("HID write failed: {error}"))?;
+    device.write(&report).map_err(|error| format_hid_error("HID write failed", error))?;
     let started = Instant::now();
     let mut input = [0u8; 64];
     while started.elapsed() < RESPONSE_TIMEOUT {
         let remaining = RESPONSE_TIMEOUT.saturating_sub(started.elapsed()).as_millis() as i32;
         let count = device.read_timeout(&mut input, remaining.max(1))
-            .map_err(|error| format!("HID read failed: {error}"))?;
+            .map_err(|error| format_hid_error("HID read failed", error))?;
         if count >= 3 && input[0] == HID_REPORT_ID && input[1] == command && input[2] == 0 {
             return Ok(input[1..count].to_vec());
         }
     }
     Err(format!("Device command {command} timed out"))
+}
+
+fn format_hid_error(context: &str, error: HidError) -> String {
+    let access_denied = matches!(
+        &error,
+        HidError::IoError { error } if error.raw_os_error() == Some(5)
+    ) || error.to_string().to_ascii_lowercase().contains("access is denied");
+
+    if access_denied {
+        format!("{context}: access is denied [ACCESS_DENIED]")
+    } else {
+        format!("{context}: {error}")
+    }
 }
 
 fn draw_battery_icon(level: Option<u8>) -> Icon {
