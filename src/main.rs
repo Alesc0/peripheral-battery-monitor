@@ -4,9 +4,12 @@ use hidapi::{HidApi, HidDevice, HidError};
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    fs::{self, OpenOptions},
+    io::Write,
+    path::PathBuf,
+    sync::{mpsc::{self, Receiver, RecvTimeoutError, Sender}, Mutex, OnceLock},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
@@ -48,6 +51,11 @@ struct Battery {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let executable = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("unknown ({error})"));
+    log_diagnostic(&format!("app started; executable={executable}"));
+
     let event_loop = EventLoop::<UiEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let (command_tx, command_rx) = mpsc::channel();
@@ -217,6 +225,7 @@ impl ApplicationHandler<UiEvent> for TrayApp {
 
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
         if let Err(error) = self.create_tray() {
+            log_diagnostic(&format!("could not create tray icon: {error}"));
             eprintln!("Could not create the Windows tray icon: {error}");
         }
     }
@@ -235,6 +244,7 @@ impl ApplicationHandler<UiEvent> for TrayApp {
                 if let Some(item) = &self.startup_item {
                     let enabled = item.is_checked();
                     if let Err(error) = set_startup_enabled(enabled) {
+                        log_diagnostic(&format!("could not save startup setting: {error}"));
                         item.set_checked(!enabled);
                         if let Some(status) = &self.status_item {
                             status.set_text(format!("Could not update startup setting: {error}"));
@@ -250,6 +260,7 @@ impl ApplicationHandler<UiEvent> for TrayApp {
                 if let Some(item) = self.alarm_items.get(&device_id) {
                     let enabled = item.is_checked();
                     if let Err(error) = set_device_alarm_enabled(&device_id, enabled) {
+                        log_diagnostic(&format!("could not save device alarm setting: {error}"));
                         item.set_checked(!enabled);
                         if let Some(status) = &self.status_item {
                             status.set_text(format!("Could not save alarm setting: {error}"));
@@ -345,18 +356,25 @@ fn read_batteries_with_retry() -> Result<Vec<Battery>, String> {
     for delay in ACCESS_DENIED_RETRY_DELAYS {
         match read_batteries() {
             Err(message) if message.contains("[ACCESS_DENIED]") => thread::sleep(delay),
-            result => return result,
+            Err(message) => {
+                log_diagnostic(&format!("HID poll failed: {message}"));
+                return Err(message);
+            }
+            Ok(batteries) => return Ok(batteries),
         }
     }
 
-    read_batteries().map_err(|message| {
-        if message.contains("[ACCESS_DENIED]") {
-            "Windows denied access to the mouse receiver. Close ScyRox or other mouse software, then choose Refresh battery."
-                .to_string()
-        } else {
-            message
+    match read_batteries() {
+        Ok(batteries) => Ok(batteries),
+        Err(message) => {
+            log_diagnostic(&format!("HID poll failed after retries: {message}"));
+            if message.contains("[ACCESS_DENIED]") {
+                Err(format!("Windows denied access after retries: {message}"))
+            } else {
+                Err(message)
+            }
         }
-    })
+    }
 }
 
 fn read_batteries() -> Result<Vec<Battery>, String> {
@@ -376,8 +394,27 @@ fn read_batteries() -> Result<Vec<Battery>, String> {
         if info.usage_page() < 0xff00 {
             continue;
         }
+        // Runtime diagnostics confirmed the F5F7 8K dongle's battery protocol
+        // is on page FF02. Other vendor pages belong to unrelated reports and
+        // reject the 17-byte battery request.
+        if info.product_id() == 0xf5f7 && info.usage_page() != 0xff02 {
+            continue;
+        }
+        log_diagnostic(&format!(
+            "HID candidate: product {:04x}, usage page {:04x}, usage {:04x}, interface {}",
+            info.product_id(),
+            info.usage_page(),
+            info.usage(),
+            info.interface_number()
+        ));
         let device_id = device_identity(&info);
         if connected_device_ids.contains(&device_id) {
+            log_diagnostic(&format!(
+                "skipping already-read HID device: product {:04x}, usage page {:04x}, interface {}",
+                info.product_id(),
+                info.usage_page(),
+                info.interface_number()
+            ));
             continue;
         }
 
@@ -385,11 +422,13 @@ fn read_batteries() -> Result<Vec<Battery>, String> {
             Ok(device) => device,
             Err(error) => {
                 last_error = format!(
-                    "{} (HID page {:04x}, interface {})",
+                    "{} (product {:04x}, HID page {:04x}, interface {})",
                     format_hid_error("could not open vendor receiver", error),
+                    info.product_id(),
                     info.usage_page(),
                     info.interface_number()
                 );
+                log_diagnostic(&last_error);
                 continue;
             }
         };
@@ -401,15 +440,25 @@ fn read_batteries() -> Result<Vec<Battery>, String> {
             .to_owned();
         match query_device(&device, device_name, device_id.clone()) {
             Ok(battery) => {
+                log_diagnostic(&format!(
+                    "battery read succeeded: product {:04x}, usage page {:04x}, interface {}, level {}%, charging {}",
+                    info.product_id(),
+                    info.usage_page(),
+                    info.interface_number(),
+                    battery.level,
+                    battery.charging
+                ));
                 connected_device_ids.insert(device_id);
                 batteries.push(battery);
             }
             Err(error) => {
                 last_error = format!(
-                    "{error} (HID page {:04x}, interface {})",
+                    "{error} (product {:04x}, HID page {:04x}, interface {})",
+                    info.product_id(),
                     info.usage_page(),
                     info.interface_number()
-                )
+                );
+                log_diagnostic(&last_error);
             }
         }
     }
@@ -488,10 +537,60 @@ fn format_hid_error(context: &str, error: HidError) -> String {
     ) || error.to_string().to_ascii_lowercase().contains("access is denied");
 
     if access_denied {
-        format!("{context}: access is denied [ACCESS_DENIED]")
+        format!("{context}: {error} [ACCESS_DENIED]")
     } else {
         format!("{context}: {error}")
     }
+}
+
+fn diagnostic_log_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|directory| directory.join("PeripheralBatteryMonitor").join("diagnostics.log"))
+}
+
+fn log_diagnostic(message: &str) {
+    const MAX_LOG_BYTES: u64 = 1_000_000;
+    const SAME_MESSAGE_INTERVAL: Duration = Duration::from_secs(30);
+    static RECENT_MESSAGES: OnceLock<Mutex<HashMap<String, SystemTime>>> = OnceLock::new();
+
+    let now = SystemTime::now();
+    let recent_messages = RECENT_MESSAGES.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut recent_messages) = recent_messages.lock() else {
+        return;
+    };
+    if recent_messages
+        .get(message)
+        .is_some_and(|previous| now.duration_since(*previous).unwrap_or_default() < SAME_MESSAGE_INTERVAL)
+    {
+        return;
+    }
+    recent_messages.insert(message.to_owned(), now);
+    drop(recent_messages);
+
+    let Some(path) = diagnostic_log_path() else {
+        return;
+    };
+    let Some(directory) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(directory).is_err() {
+        return;
+    }
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= MAX_LOG_BYTES) {
+        let previous_log = path.with_extension("log.1");
+        let _ = fs::remove_file(&previous_log);
+        let _ = fs::rename(&path, previous_log);
+    }
+
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let timestamp = now
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let _ = writeln!(file, "{timestamp} UTC {message}");
 }
 
 fn draw_battery_icon(level: Option<u8>) -> Icon {
