@@ -2,6 +2,7 @@
 
 use hidapi::{HidApi, HidDevice, HidError};
 use std::{
+    collections::{HashMap, HashSet},
     error::Error,
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread,
@@ -21,6 +22,7 @@ const VENDOR_ID: u16 = 0x3554;
 const WIRELESS_PRODUCT_IDS: [u16; 3] = [0xf5f4, 0xf5f7, 0xf517];
 const HID_REPORT_ID: u8 = 8;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const LOW_BATTERY_THRESHOLD: u8 = 10;
 const ACCESS_DENIED_RETRY_DELAYS: [Duration; 2] = [
     Duration::from_millis(250),
     Duration::from_millis(750),
@@ -28,9 +30,10 @@ const ACCESS_DENIED_RETRY_DELAYS: [Duration; 2] = [
 const RESPONSE_TIMEOUT: Duration = Duration::from_millis(1_200);
 const STARTUP_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_VALUE: &str = "PeripheralBatteryMonitor";
+const ALARM_SETTINGS_KEY: &str = r"Software\PeripheralBatteryMonitor\BatteryAlarms";
 
 enum UiEvent {
-    Battery(Result<Battery, String>),
+    Batteries(Result<Vec<Battery>, String>),
 }
 
 enum Command {
@@ -38,6 +41,7 @@ enum Command {
 }
 
 struct Battery {
+    device_id: String,
     device_name: String,
     level: u8,
     charging: bool,
@@ -62,6 +66,10 @@ struct TrayApp {
     status_item: Option<MenuItem>,
     refresh_item: Option<MenuItem>,
     startup_item: Option<CheckMenuItem>,
+    alarm_submenu: Option<Submenu>,
+    alarm_items: HashMap<String, CheckMenuItem>,
+    low_battery_alarm_fired: HashSet<String>,
+    next_alarm_menu_id: u32,
     quit_item: Option<MenuItem>,
 }
 
@@ -73,6 +81,10 @@ impl TrayApp {
             status_item: None,
             refresh_item: None,
             startup_item: None,
+            alarm_submenu: None,
+            alarm_items: HashMap::new(),
+            low_battery_alarm_fired: HashSet::new(),
+            next_alarm_menu_id: 0,
             quit_item: None,
         }
     }
@@ -91,7 +103,8 @@ impl TrayApp {
             startup_enabled(),
             None,
         );
-        let settings = Submenu::with_items("Settings", true, &[&startup])?;
+        let alarms = Submenu::new("Low battery alarms", true);
+        let settings = Submenu::with_items("Settings", true, &[&startup, &alarms])?;
         let quit = MenuItem::with_id("quit-app", "Quit", true, None);
         let menu = Menu::with_items(&[&status, &refresh, &settings, &quit])?;
         let tray = TrayIconBuilder::new()
@@ -104,19 +117,39 @@ impl TrayApp {
         self.status_item = Some(status);
         self.refresh_item = Some(refresh);
         self.startup_item = Some(startup);
+        self.alarm_submenu = Some(alarms);
         self.quit_item = Some(quit);
         self.tray = Some(tray);
         Ok(())
     }
 
-    fn show_state(&mut self, result: Result<Battery, String>) {
+    fn show_state(&mut self, result: Result<Vec<Battery>, String>) {
         let (icon, tooltip, menu_text) = match result {
-            Ok(battery) => {
-                let charge = if battery.charging { " · charging" } else { "" };
-                let text = format!("{} — {}%{}", battery.device_name, battery.level, charge);
-                let tooltip = format!("{}: {}%{}", battery.device_name, battery.level, charge);
-                (draw_battery_icon(Some(battery.level)), tooltip, text)
+            Ok(batteries) if !batteries.is_empty() => {
+                for battery in &batteries {
+                    self.register_device_alarm(battery);
+                    self.update_low_battery_alarm(battery);
+                }
+
+                let lowest = batteries.iter().min_by_key(|battery| battery.level).unwrap();
+                let details = batteries
+                    .iter()
+                    .map(|battery| {
+                        let charge = if battery.charging { " · charging" } else { "" };
+                        format!("{}: {}%{}", battery.device_name, battery.level, charge)
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    draw_battery_icon(Some(lowest.level)),
+                    details.join(" | "),
+                    details.join(" | "),
+                )
             }
+            Ok(_) => (
+                draw_battery_icon(None),
+                "Peripheral Battery: no supported device found".into(),
+                "no supported device found".into(),
+            ),
             Err(message) => (
                 draw_battery_icon(None),
                 format!("Peripheral Battery: {message}"),
@@ -130,6 +163,45 @@ impl TrayApp {
         }
         if let Some(item) = &self.status_item {
             item.set_text(menu_text);
+        }
+    }
+
+    fn register_device_alarm(&mut self, battery: &Battery) {
+        if self.alarm_items.contains_key(&battery.device_id) {
+            return;
+        }
+
+        let Some(submenu) = &self.alarm_submenu else {
+            return;
+        };
+
+        self.next_alarm_menu_id += 1;
+        let menu_id = format!("battery-alarm-{}", self.next_alarm_menu_id);
+        let item = CheckMenuItem::with_id(
+            menu_id,
+            format!("{} low-battery alarm", battery.device_name),
+            true,
+            device_alarm_enabled(&battery.device_id),
+            None,
+        );
+        if submenu.append(&item).is_ok() {
+            self.alarm_items.insert(battery.device_id.clone(), item);
+        }
+    }
+
+    fn update_low_battery_alarm(&mut self, battery: &Battery) {
+        if battery.level > LOW_BATTERY_THRESHOLD {
+            self.low_battery_alarm_fired.remove(&battery.device_id);
+            return;
+        }
+
+        let first_low_reading = self.low_battery_alarm_fired.insert(battery.device_id.clone());
+        let enabled = self
+            .alarm_items
+            .get(&battery.device_id)
+            .is_some_and(CheckMenuItem::is_checked);
+        if first_low_reading && enabled {
+            play_low_battery_alarm();
         }
     }
 }
@@ -151,7 +223,7 @@ impl ApplicationHandler<UiEvent> for TrayApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UiEvent) {
         match event {
-            UiEvent::Battery(result) => self.show_state(result),
+            UiEvent::Batteries(result) => self.show_state(result),
         }
     }
 
@@ -169,6 +241,21 @@ impl ApplicationHandler<UiEvent> for TrayApp {
                         }
                     }
                 }
+            } else if let Some(device_id) = self
+                .alarm_items
+                .iter()
+                .find(|(_, item)| &event.id == item.id())
+                .map(|(device_id, _)| device_id.clone())
+            {
+                if let Some(item) = self.alarm_items.get(&device_id) {
+                    let enabled = item.is_checked();
+                    if let Err(error) = set_device_alarm_enabled(&device_id, enabled) {
+                        item.set_checked(!enabled);
+                        if let Some(status) = &self.status_item {
+                            status.set_text(format!("Could not save alarm setting: {error}"));
+                        }
+                    }
+                }
             } else if self.quit_item.as_ref().is_some_and(|item| &event.id == item.id()) {
                 event_loop.exit();
             }
@@ -182,6 +269,41 @@ fn startup_enabled() -> bool {
     hkcu.open_subkey(STARTUP_RUN_KEY)
         .and_then(|run_key| run_key.get_value::<String, _>(STARTUP_VALUE))
         .is_ok()
+}
+
+fn device_alarm_enabled(device_id: &str) -> bool {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    hkcu.open_subkey(ALARM_SETTINGS_KEY)
+        .and_then(|key| key.get_value::<u32, _>(&alarm_registry_value_name(device_id)))
+        .map(|value| value != 0)
+        .unwrap_or(true)
+}
+
+fn set_device_alarm_enabled(device_id: &str, enabled: bool) -> std::io::Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu.create_subkey(ALARM_SETTINGS_KEY)?;
+    key.set_value(&alarm_registry_value_name(device_id), &u32::from(enabled))
+}
+
+fn alarm_registry_value_name(device_id: &str) -> String {
+    // Keep arbitrary HID serials/paths out of registry value names.
+    let hash = device_id.as_bytes().iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("device_{hash:016x}")
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn MessageBeep(beep_type: u32) -> i32;
+}
+
+fn play_low_battery_alarm() {
+    const MB_ICONWARNING: u32 = 0x30;
+    // Ask Windows to play the configured warning sound (or its default beep).
+    unsafe {
+        MessageBeep(MB_ICONWARNING);
+    }
 }
 
 fn set_startup_enabled(enabled: bool) -> std::io::Result<()> {
@@ -214,20 +336,20 @@ fn poll_worker(proxy: EventLoopProxy<UiEvent>, commands: Receiver<Command>) {
         }
         first_poll = false;
 
-        let result = read_battery_with_retry();
-        let _ = proxy.send_event(UiEvent::Battery(result));
+        let result = read_batteries_with_retry();
+        let _ = proxy.send_event(UiEvent::Batteries(result));
     }
 }
 
-fn read_battery_with_retry() -> Result<Battery, String> {
+fn read_batteries_with_retry() -> Result<Vec<Battery>, String> {
     for delay in ACCESS_DENIED_RETRY_DELAYS {
-        match read_battery() {
+        match read_batteries() {
             Err(message) if message.contains("[ACCESS_DENIED]") => thread::sleep(delay),
             result => return result,
         }
     }
 
-    read_battery().map_err(|message| {
+    read_batteries().map_err(|message| {
         if message.contains("[ACCESS_DENIED]") {
             "Windows denied access to the mouse receiver. Close ScyRox or other mouse software, then choose Refresh battery."
                 .to_string()
@@ -237,9 +359,11 @@ fn read_battery_with_retry() -> Result<Battery, String> {
     })
 }
 
-fn read_battery() -> Result<Battery, String> {
+fn read_batteries() -> Result<Vec<Battery>, String> {
     let api = HidApi::new().map_err(|error| format!("HID unavailable: {error}"))?;
     let mut last_error = "wireless mouse not found".to_string();
+    let mut batteries = Vec::new();
+    let mut connected_device_ids = HashSet::new();
 
     for info in api.device_list() {
         if info.vendor_id() != VENDOR_ID || !WIRELESS_PRODUCT_IDS.contains(&info.product_id()) {
@@ -250,6 +374,10 @@ fn read_battery() -> Result<Battery, String> {
         // produces misleading access-denied errors. The ScyRox protocol lives
         // on its vendor-defined HID collections.
         if info.usage_page() < 0xff00 {
+            continue;
+        }
+        let device_id = device_identity(&info);
+        if connected_device_ids.contains(&device_id) {
             continue;
         }
 
@@ -271,8 +399,11 @@ fn read_battery() -> Result<Battery, String> {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or("ScyRox wireless mouse")
             .to_owned();
-        match query_device(&device, device_name) {
-            Ok(battery) => return Ok(battery),
+        match query_device(&device, device_name, device_id.clone()) {
+            Ok(battery) => {
+                connected_device_ids.insert(device_id);
+                batteries.push(battery);
+            }
             Err(error) => {
                 last_error = format!(
                     "{error} (HID page {:04x}, interface {})",
@@ -283,10 +414,29 @@ fn read_battery() -> Result<Battery, String> {
         }
     }
 
-    Err(last_error)
+    if batteries.is_empty() {
+        Err(last_error)
+    } else {
+        Ok(batteries)
+    }
 }
 
-fn query_device(device: &HidDevice, device_name: String) -> Result<Battery, String> {
+fn device_identity(info: &hidapi::DeviceInfo) -> String {
+    let serial = info.serial_number().filter(|serial| !serial.trim().is_empty());
+    let identity = if let Some(serial) = serial {
+        format!("serial:{}", serial.trim())
+    } else {
+        let mut path = info.path().to_string_lossy().to_ascii_lowercase();
+        for collection in 1..=16 {
+            path = path.replace(&format!("&col{collection:02x}"), "&colxx");
+            path = path.replace(&format!("&col{collection:02}"), "&colxx");
+        }
+        format!("path:{path}")
+    };
+    format!("{:04x}:{}", info.product_id(), identity)
+}
+
+fn query_device(device: &HidDevice, device_name: String, device_id: String) -> Result<Battery, String> {
     // The ScyRox app initializes this HID endpoint with an eight-byte nonce.
     let mut init_data = [0u8; 8];
     getrandom::fill(&mut init_data).map_err(|error| format!("random initializer failed: {error}"))?;
@@ -300,7 +450,7 @@ fn query_device(device: &HidDevice, device_name: String) -> Result<Battery, Stri
     let response = request(device, 4, None)?;
     let level = response.get(5).copied().ok_or("short battery response")?.min(100);
     let charging = response.get(6).copied().ok_or("short battery response")? == 1;
-    Ok(Battery { device_name, level, charging })
+    Ok(Battery { device_id, device_name, level, charging })
 }
 
 fn request(device: &HidDevice, command: u8, data: Option<&[u8]>) -> Result<Vec<u8>, String> {

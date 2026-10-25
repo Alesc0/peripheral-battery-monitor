@@ -2,6 +2,8 @@
 
 Peripheral Battery Monitor is a small Windows system tray app for checking peripheral battery levels. It currently supports ScyRox wireless mice, with a general app name and structure for adding more devices later.
 
+The app can poll multiple supported devices. Under **Settings > Low battery alarms**, toggle the warning sound for each detected device. An enabled alarm sounds once when that device reaches 10% or less, and rearms after it rises above 10%.
+
 Click the tray icon to see the connected device name, battery percentage, and charging state. The app refreshes every five seconds. Use **Settings → Start with Windows** to toggle startup for your Windows account, **Refresh battery** to request an immediate update, or **Quit** to close the app.
 
 ## Download the portable executable
