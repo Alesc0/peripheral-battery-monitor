@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use hidapi::{HidApi, HidDevice, HidError};
 use std::{
@@ -7,7 +7,10 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::PathBuf,
-    sync::{mpsc::{self, Receiver, RecvTimeoutError, Sender}, Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -15,10 +18,12 @@ use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, Submenu},
 };
+#[cfg(windows)]
 use winit::{
     application::ApplicationHandler,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
 };
+#[cfg(windows)]
 use winreg::{RegKey, enums::HKEY_CURRENT_USER};
 
 const VENDOR_ID: u16 = 0x3554;
@@ -26,16 +31,28 @@ const WIRELESS_PRODUCT_IDS: [u16; 3] = [0xf5f4, 0xf5f7, 0xf517];
 const HID_REPORT_ID: u8 = 8;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LOW_BATTERY_THRESHOLD: u8 = 10;
-const ACCESS_DENIED_RETRY_DELAYS: [Duration; 2] = [
-    Duration::from_millis(250),
-    Duration::from_millis(750),
-];
+const ACCESS_DENIED_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(250), Duration::from_millis(750)];
 const RESPONSE_TIMEOUT: Duration = Duration::from_millis(1_200);
+#[cfg(windows)]
 const STARTUP_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
 const STARTUP_VALUE: &str = "PeripheralBatteryMonitor";
+#[cfg(windows)]
 const ALARM_SETTINGS_KEY: &str = r"Software\PeripheralBatteryMonitor\BatteryAlarms";
+#[cfg(windows)]
 const BATTERY_CACHE_KEY: &str = r"Software\PeripheralBatteryMonitor\BatteryCache";
 const MOUSE_ASLEEP_ERROR: &str = "mouse is asleep/offline; battery is not currently responding";
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux::*;
+
+#[cfg(windows)]
+type UiEventSender = EventLoopProxy<UiEvent>;
+#[cfg(target_os = "linux")]
+type UiEventSender = Sender<UiEvent>;
 
 enum UiEvent {
     Batteries(Result<Vec<Battery>, String>),
@@ -59,6 +76,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|error| format!("unknown ({error})"));
     log_diagnostic(&format!("app started; executable={executable}"));
 
+    run_app()
+}
+
+#[cfg(windows)]
+fn run_app() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::<UiEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let (command_tx, command_rx) = mpsc::channel();
@@ -105,11 +127,20 @@ impl TrayApp {
             return Ok(());
         }
 
-        let status = MenuItem::with_id("battery-status", "Searching for a supported device…", false, None);
+        let status = MenuItem::with_id(
+            "battery-status",
+            "Searching for a supported device…",
+            false,
+            None,
+        );
         let refresh = MenuItem::with_id("refresh-battery", "Refresh battery", true, None);
         let startup = CheckMenuItem::with_id(
             "windows-startup",
-            "Start with Windows",
+            if cfg!(windows) {
+                "Start with Windows"
+            } else {
+                "Start at login"
+            },
             true,
             startup_enabled(),
             None,
@@ -123,6 +154,8 @@ impl TrayApp {
             .with_icon(draw_battery_icon(None))
             .with_menu(Box::new(menu))
             .build()?;
+        #[cfg(target_os = "linux")]
+        tray.set_title(Some("Peripheral Battery Monitor"));
         tray.set_show_menu_on_left_click(true);
 
         self.status_item = Some(status);
@@ -144,7 +177,10 @@ impl TrayApp {
                     }
                 }
 
-                let lowest = batteries.iter().min_by_key(|battery| battery.level).unwrap();
+                let lowest = batteries
+                    .iter()
+                    .min_by_key(|battery| battery.level)
+                    .unwrap();
                 let details = batteries
                     .iter()
                     .map(|battery| {
@@ -215,7 +251,9 @@ impl TrayApp {
             return;
         }
 
-        let first_low_reading = self.low_battery_alarm_fired.insert(battery.device_id.clone());
+        let first_low_reading = self
+            .low_battery_alarm_fired
+            .insert(battery.device_id.clone());
         let enabled = self
             .alarm_items
             .get(&battery.device_id)
@@ -226,6 +264,7 @@ impl TrayApp {
     }
 }
 
+#[cfg(windows)]
 impl ApplicationHandler<UiEvent> for TrayApp {
     fn window_event(
         &mut self,
@@ -238,7 +277,7 @@ impl ApplicationHandler<UiEvent> for TrayApp {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
         if let Err(error) = self.create_tray() {
             log_diagnostic(&format!("could not create tray icon: {error}"));
-            eprintln!("Could not create the Windows tray icon: {error}");
+            eprintln!("Could not create the tray icon: {error}");
         }
     }
 
@@ -249,10 +288,29 @@ impl ApplicationHandler<UiEvent> for TrayApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.handle_menu_events() {
+            event_loop.exit();
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(250),
+        ));
+    }
+}
+
+impl TrayApp {
+    fn handle_menu_events(&mut self) -> bool {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if self.refresh_item.as_ref().is_some_and(|item| &event.id == item.id()) {
+            if self
+                .refresh_item
+                .as_ref()
+                .is_some_and(|item| event.id == item.id())
+            {
                 let _ = self.command_tx.send(Command::Refresh);
-            } else if self.startup_item.as_ref().is_some_and(|item| &event.id == item.id()) {
+            } else if self
+                .startup_item
+                .as_ref()
+                .is_some_and(|item| event.id == item.id())
+            {
                 if let Some(item) = &self.startup_item {
                     let enabled = item.is_checked();
                     if let Err(error) = set_startup_enabled(enabled) {
@@ -266,7 +324,7 @@ impl ApplicationHandler<UiEvent> for TrayApp {
             } else if let Some(device_id) = self
                 .alarm_items
                 .iter()
-                .find(|(_, item)| &event.id == item.id())
+                .find(|(_, item)| event.id == item.id())
                 .map(|(device_id, _)| device_id.clone())
             {
                 if let Some(item) = self.alarm_items.get(&device_id) {
@@ -279,14 +337,19 @@ impl ApplicationHandler<UiEvent> for TrayApp {
                         }
                     }
                 }
-            } else if self.quit_item.as_ref().is_some_and(|item| &event.id == item.id()) {
-                event_loop.exit();
+            } else if self
+                .quit_item
+                .as_ref()
+                .is_some_and(|item| event.id == item.id())
+            {
+                return true;
             }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(250)));
+        false
     }
 }
 
+#[cfg(windows)]
 fn startup_enabled() -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     hkcu.open_subkey(STARTUP_RUN_KEY)
@@ -294,6 +357,7 @@ fn startup_enabled() -> bool {
         .is_ok()
 }
 
+#[cfg(windows)]
 fn device_alarm_enabled(device_id: &str) -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     hkcu.open_subkey(ALARM_SETTINGS_KEY)
@@ -302,16 +366,23 @@ fn device_alarm_enabled(device_id: &str) -> bool {
         .unwrap_or(true)
 }
 
+#[cfg(windows)]
 fn set_device_alarm_enabled(device_id: &str, enabled: bool) -> std::io::Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (key, _) = hkcu.create_subkey(ALARM_SETTINGS_KEY)?;
     key.set_value(&alarm_registry_value_name(device_id), &u32::from(enabled))
 }
 
+#[cfg(windows)]
 fn battery_cache_key(device_id: &str) -> String {
-    format!(r"{}\{}", BATTERY_CACHE_KEY, alarm_registry_value_name(device_id))
+    format!(
+        r"{}\{}",
+        BATTERY_CACHE_KEY,
+        alarm_registry_value_name(device_id)
+    )
 }
 
+#[cfg(windows)]
 fn load_cached_battery(device_id: &str, device_name: &str) -> Option<Battery> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let cache = hkcu.open_subkey(battery_cache_key(device_id)).ok()?;
@@ -329,6 +400,7 @@ fn load_cached_battery(device_id: &str, device_name: &str) -> Option<Battery> {
     })
 }
 
+#[cfg(windows)]
 fn store_cached_battery(battery: &Battery) -> std::io::Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (cache, _) = hkcu.create_subkey(battery_cache_key(&battery.device_id))?;
@@ -339,17 +411,22 @@ fn store_cached_battery(battery: &Battery) -> std::io::Result<()> {
 
 fn alarm_registry_value_name(device_id: &str) -> String {
     // Keep arbitrary HID serials/paths out of registry value names.
-    let hash = device_id.as_bytes().iter().fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    });
+    let hash = device_id
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
     format!("device_{hash:016x}")
 }
 
+#[cfg(windows)]
 #[link(name = "user32")]
 unsafe extern "system" {
     fn MessageBeep(beep_type: u32) -> i32;
 }
 
+#[cfg(windows)]
 fn play_low_battery_alarm() {
     const MB_ICONWARNING: u32 = 0x30;
     // Ask Windows to play the configured warning sound (or its default beep).
@@ -358,6 +435,7 @@ fn play_low_battery_alarm() {
     }
 }
 
+#[cfg(windows)]
 fn set_startup_enabled(enabled: bool) -> std::io::Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     if enabled {
@@ -377,7 +455,7 @@ fn set_startup_enabled(enabled: bool) -> std::io::Result<()> {
     }
 }
 
-fn poll_worker(proxy: EventLoopProxy<UiEvent>, commands: Receiver<Command>) {
+fn poll_worker(proxy: UiEventSender, commands: Receiver<Command>) {
     let mut first_poll = true;
     loop {
         if !first_poll {
@@ -389,7 +467,13 @@ fn poll_worker(proxy: EventLoopProxy<UiEvent>, commands: Receiver<Command>) {
         first_poll = false;
 
         let result = read_batteries_with_retry();
-        let _ = proxy.send_event(UiEvent::Batteries(result));
+        #[cfg(windows)]
+        let sent = proxy.send_event(UiEvent::Batteries(result)).is_ok();
+        #[cfg(target_os = "linux")]
+        let sent = proxy.send(UiEvent::Batteries(result)).is_ok();
+        if !sent {
+            return;
+        }
     }
 }
 
@@ -410,7 +494,7 @@ fn read_batteries_with_retry() -> Result<Vec<Battery>, String> {
         Err(message) => {
             log_diagnostic(&format!("HID poll failed after retries: {message}"));
             if message.contains("[ACCESS_DENIED]") {
-                Err(format!("Windows denied access after retries: {message}"))
+                Err(format!("Receiver access denied after retries: {message}"))
             } else {
                 Err(message)
             }
@@ -448,7 +532,7 @@ fn read_batteries() -> Result<Vec<Battery>, String> {
             info.usage(),
             info.interface_number()
         ));
-        let device_id = device_identity(&info);
+        let device_id = device_identity(info);
         if connected_device_ids.contains(&device_id) {
             log_diagnostic(&format!(
                 "skipping already-read HID device: product {:04x}, usage page {:04x}, interface {}",
@@ -463,10 +547,11 @@ fn read_batteries() -> Result<Vec<Battery>, String> {
             Ok(device) => device,
             Err(error) => {
                 last_error = format!(
-                    "{} (product {:04x}, HID page {:04x}, interface {})",
+                    "{} (product {:04x}, HID page {:04x}, usage {:04x}, interface {})",
                     format_hid_error("could not open vendor receiver", error),
                     info.product_id(),
                     info.usage_page(),
+                    info.usage(),
                     info.interface_number()
                 );
                 log_diagnostic(&last_error);
@@ -489,10 +574,10 @@ fn read_batteries() -> Result<Vec<Battery>, String> {
                     battery.level,
                     battery.charging
                 ));
-                if !battery.is_stale {
-                    if let Err(error) = store_cached_battery(&battery) {
-                        log_diagnostic(&format!("could not save battery cache: {error}"));
-                    }
+                if !battery.is_stale
+                    && let Err(error) = store_cached_battery(&battery)
+                {
+                    log_diagnostic(&format!("could not save battery cache: {error}"));
                 }
                 connected_device_ids.insert(device_id);
                 batteries.push(battery);
@@ -522,9 +607,10 @@ fn read_batteries() -> Result<Vec<Battery>, String> {
             }
             Err(error) => {
                 last_error = format!(
-                    "{error} (product {:04x}, HID page {:04x}, interface {})",
+                    "{error} (product {:04x}, HID page {:04x}, usage {:04x}, interface {})",
                     info.product_id(),
                     info.usage_page(),
+                    info.usage(),
                     info.interface_number()
                 );
                 log_diagnostic(&last_error);
@@ -540,7 +626,9 @@ fn read_batteries() -> Result<Vec<Battery>, String> {
 }
 
 fn device_identity(info: &hidapi::DeviceInfo) -> String {
-    let serial = info.serial_number().filter(|serial| !serial.trim().is_empty());
+    let serial = info
+        .serial_number()
+        .filter(|serial| !serial.trim().is_empty());
     let identity = if let Some(serial) = serial {
         format!("serial:{}", serial.trim())
     } else {
@@ -554,10 +642,15 @@ fn device_identity(info: &hidapi::DeviceInfo) -> String {
     format!("{:04x}:{}", info.product_id(), identity)
 }
 
-fn query_device(device: &HidDevice, device_name: String, device_id: String) -> Result<Battery, String> {
+fn query_device(
+    device: &HidDevice,
+    device_name: String,
+    device_id: String,
+) -> Result<Battery, String> {
     // The ScyRox app initializes this HID endpoint with an eight-byte nonce.
     let mut init_data = [0u8; 8];
-    getrandom::fill(&mut init_data).map_err(|error| format!("random initializer failed: {error}"))?;
+    getrandom::fill(&mut init_data)
+        .map_err(|error| format!("random initializer failed: {error}"))?;
     request(device, 1, Some(&init_data))?;
 
     let online = request(device, 3, None)?;
@@ -568,7 +661,11 @@ fn query_device(device: &HidDevice, device_name: String, device_id: String) -> R
         Err(_) if !is_online => return Err(MOUSE_ASLEEP_ERROR.into()),
         Err(error) => return Err(error),
     };
-    let level = response.get(5).copied().ok_or("short battery response")?.min(100);
+    let level = response
+        .get(5)
+        .copied()
+        .ok_or("short battery response")?
+        .min(100);
     let charging = response.get(6).copied().ok_or("short battery response")? == 1;
     Ok(Battery {
         device_id,
@@ -590,15 +687,24 @@ fn request(device: &HidDevice, command: u8, data: Option<&[u8]>) -> Result<Vec<u
         report[5] = data.len() as u8;
         report[6..6 + data.len()].copy_from_slice(data);
     }
-    let checksum = 85u8.wrapping_sub(report[1..16].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)));
+    let checksum = 85u8.wrapping_sub(
+        report[1..16]
+            .iter()
+            .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+    );
     report[16] = checksum.wrapping_sub(HID_REPORT_ID);
 
-    device.write(&report).map_err(|error| format_hid_error("HID write failed", error))?;
+    device
+        .write(&report)
+        .map_err(|error| format_hid_error("HID write failed", error))?;
     let started = Instant::now();
     let mut input = [0u8; 64];
     while started.elapsed() < RESPONSE_TIMEOUT {
-        let remaining = RESPONSE_TIMEOUT.saturating_sub(started.elapsed()).as_millis() as i32;
-        let count = device.read_timeout(&mut input, remaining.max(1))
+        let remaining = RESPONSE_TIMEOUT
+            .saturating_sub(started.elapsed())
+            .as_millis() as i32;
+        let count = device
+            .read_timeout(&mut input, remaining.max(1))
             .map_err(|error| format_hid_error("HID read failed", error))?;
         if count >= 3 && input[0] == HID_REPORT_ID && input[1] == command && input[2] == 0 {
             return Ok(input[1..count].to_vec());
@@ -610,8 +716,11 @@ fn request(device: &HidDevice, command: u8, data: Option<&[u8]>) -> Result<Vec<u
 fn format_hid_error(context: &str, error: HidError) -> String {
     let access_denied = matches!(
         &error,
-        HidError::IoError { error } if error.raw_os_error() == Some(5)
-    ) || error.to_string().to_ascii_lowercase().contains("access is denied");
+        HidError::IoError { error } if error.kind() == std::io::ErrorKind::PermissionDenied
+    ) || {
+        let message = error.to_string().to_ascii_lowercase();
+        message.contains("access is denied") || message.contains("permission denied")
+    };
 
     if access_denied {
         format!("{context}: {error} [ACCESS_DENIED]")
@@ -620,10 +729,15 @@ fn format_hid_error(context: &str, error: HidError) -> String {
     }
 }
 
+#[cfg(windows)]
 fn diagnostic_log_path() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
-        .map(|directory| directory.join("PeripheralBatteryMonitor").join("diagnostics.log"))
+        .map(|directory| {
+            directory
+                .join("PeripheralBatteryMonitor")
+                .join("diagnostics.log")
+        })
 }
 
 fn log_diagnostic(message: &str) {
@@ -636,10 +750,9 @@ fn log_diagnostic(message: &str) {
     let Ok(mut recent_messages) = recent_messages.lock() else {
         return;
     };
-    if recent_messages
-        .get(message)
-        .is_some_and(|previous| now.duration_since(*previous).unwrap_or_default() < SAME_MESSAGE_INTERVAL)
-    {
+    if recent_messages.get(message).is_some_and(|previous| {
+        now.duration_since(*previous).unwrap_or_default() < SAME_MESSAGE_INTERVAL
+    }) {
         return;
     }
     recent_messages.insert(message.to_owned(), now);
