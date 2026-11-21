@@ -53,7 +53,7 @@ fn state_directory() -> std::io::Result<PathBuf> {
     Ok(xdg_directory("XDG_STATE_HOME", ".local/state")?.join("peripheral-battery-monitor"))
 }
 
-fn write_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+pub(super) fn write_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

@@ -70,7 +70,14 @@ struct Battery {
     is_stale: bool,
 }
 
+mod battery;
+mod calibration;
+
 fn main() -> Result<(), Box<dyn Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--battery-report") {
+        calibration::report()?;
+        return Ok(());
+    }
     let executable = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|error| format!("unknown ({error})"));
@@ -457,6 +464,7 @@ fn set_startup_enabled(enabled: bool) -> std::io::Result<()> {
 
 fn poll_worker(proxy: UiEventSender, commands: Receiver<Command>) {
     let mut first_poll = true;
+    let mut tracking = calibration::Tracking::default();
     loop {
         if !first_poll {
             match commands.recv_timeout(POLL_INTERVAL) {
@@ -466,7 +474,7 @@ fn poll_worker(proxy: UiEventSender, commands: Receiver<Command>) {
         }
         first_poll = false;
 
-        let result = read_batteries_with_retry();
+        let result = read_batteries_with_retry(&mut tracking);
         #[cfg(windows)]
         let sent = proxy.send_event(UiEvent::Batteries(result)).is_ok();
         #[cfg(target_os = "linux")]
@@ -477,9 +485,9 @@ fn poll_worker(proxy: UiEventSender, commands: Receiver<Command>) {
     }
 }
 
-fn read_batteries_with_retry() -> Result<Vec<Battery>, String> {
+fn read_batteries_with_retry(tracking: &mut calibration::Tracking) -> Result<Vec<Battery>, String> {
     for delay in ACCESS_DENIED_RETRY_DELAYS {
-        match read_batteries() {
+        match read_batteries(tracking) {
             Err(message) if message.contains("[ACCESS_DENIED]") => thread::sleep(delay),
             Err(message) => {
                 log_diagnostic(&format!("HID poll failed: {message}"));
@@ -489,7 +497,7 @@ fn read_batteries_with_retry() -> Result<Vec<Battery>, String> {
         }
     }
 
-    match read_batteries() {
+    match read_batteries(tracking) {
         Ok(batteries) => Ok(batteries),
         Err(message) => {
             log_diagnostic(&format!("HID poll failed after retries: {message}"));
@@ -502,7 +510,7 @@ fn read_batteries_with_retry() -> Result<Vec<Battery>, String> {
     }
 }
 
-fn read_batteries() -> Result<Vec<Battery>, String> {
+fn read_batteries(tracking: &mut calibration::Tracking) -> Result<Vec<Battery>, String> {
     let api = HidApi::new().map_err(|error| format!("HID unavailable: {error}"))?;
     let mut last_error = "wireless mouse not found".to_string();
     let mut batteries = Vec::new();
@@ -564,7 +572,7 @@ fn read_batteries() -> Result<Vec<Battery>, String> {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or("ScyRox wireless mouse")
             .to_owned();
-        match query_device(&device, device_name.clone(), device_id.clone()) {
+        match query_device(&device, device_name.clone(), device_id.clone(), tracking) {
             Ok(battery) => {
                 log_diagnostic(&format!(
                     "battery read succeeded: product {:04x}, usage page {:04x}, interface {}, level {}%, charging {}",
@@ -646,6 +654,7 @@ fn query_device(
     device: &HidDevice,
     device_name: String,
     device_id: String,
+    tracking: &mut calibration::Tracking,
 ) -> Result<Battery, String> {
     // The ScyRox app initializes this HID endpoint with an eight-byte nonce.
     let mut init_data = [0u8; 8];
@@ -661,12 +670,24 @@ fn query_device(
         Err(_) if !is_online => return Err(MOUSE_ASLEEP_ERROR.into()),
         Err(error) => return Err(error),
     };
-    let level = response
+    let raw_level = response
         .get(5)
         .copied()
         .ok_or("short battery response")?
         .min(100);
     let charging = response.get(6).copied().ok_or("short battery response")? == 1;
+    let level = if is_online {
+        tracking.observe(
+            &device_id,
+            &device_name,
+            raw_level,
+            battery::voltage(&response),
+            charging,
+        )
+    } else {
+        // Sleeping replies must not advance history, full-charge confirmation, or calibration.
+        load_cached_battery(&device_id, &device_name).map_or(raw_level, |cached| cached.level)
+    };
     Ok(Battery {
         device_id,
         device_name,
@@ -786,7 +807,6 @@ fn log_diagnostic(message: &str) {
 fn draw_battery_icon(level: Option<u8>) -> Icon {
     const SIZE: usize = 32;
     let mut pixels = vec![0u8; SIZE * SIZE * 4];
-    let frame = [220, 224, 230, 255];
     let fill = match level {
         Some(value) if value <= 15 => [237, 91, 91, 255],
         Some(value) if value <= 35 => [238, 183, 78, 255],
@@ -794,32 +814,43 @@ fn draw_battery_icon(level: Option<u8>) -> Icon {
         None => [112, 116, 126, 255],
     };
 
-    // Battery outline and terminal.
-    for y in 5..28 {
-        for x in 7..25 {
-            if x == 7 || x == 24 || y == 5 || y == 27 {
-                pixel(&mut pixels, SIZE, x, y, frame);
-            }
-        }
-    }
-    for y in 2..5 {
-        for x in 12..20 {
-            pixel(&mut pixels, SIZE, x, y, frame);
-        }
-    }
-
-    if let Some(value) = level {
-        let rows = value as usize * 17 / 100;
-        for y in (9..26).rev().take(rows) {
-            for x in 10..22 {
-                pixel(&mut pixels, SIZE, x, y, fill);
-            }
-        }
-    } else {
-        for y in 12..21 {
-            for x in 10..22 {
-                if (x + y) % 4 == 0 {
-                    pixel(&mut pixels, SIZE, x, y, fill);
+    // Compact bitmap lettering keeps the percentage readable without a font dependency.
+    // Three digits plus the percent sign fit even at 100%.
+    let text = level.map_or_else(|| "--".to_owned(), |value| format!("{value}%"));
+    const SCALE_X: usize = 2;
+    const SCALE_Y: usize = 4;
+    let text_width = (text.len() * 4 - 1) * SCALE_X;
+    let left = (SIZE - text_width) / 2;
+    let top = (SIZE - 5 * SCALE_Y) / 2;
+    for (index, character) in text.chars().enumerate() {
+        let rows = match character {
+            '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
+            '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
+            '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
+            '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
+            '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
+            '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
+            '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
+            '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
+            '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
+            '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
+            '%' => [0b101, 0b001, 0b010, 0b100, 0b101],
+            _ => [0, 0, 0b111, 0, 0],
+        };
+        for (row, bits) in rows.iter().enumerate() {
+            for column in 0..3 {
+                if bits & (1 << (2 - column)) != 0 {
+                    for dy in 0..SCALE_Y {
+                        for dx in 0..SCALE_X {
+                            pixel(
+                                &mut pixels,
+                                SIZE,
+                                left + index * 4 * SCALE_X + column * SCALE_X + dx,
+                                top + row * SCALE_Y + dy,
+                                fill,
+                            );
+                        }
+                    }
                 }
             }
         }

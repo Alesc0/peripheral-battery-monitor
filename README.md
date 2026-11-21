@@ -2,6 +2,8 @@
 
 Peripheral Battery Monitor is a small Windows and Linux system tray app for checking peripheral battery levels. It currently supports ScyRox wireless mice.
 
+The tray displays the battery percentage directly, using the lowest level when multiple devices are connected. It shows `--` when no battery reading is available. Green, amber, and red text indicate normal, low, and very low battery levels.
+
 The app can poll multiple supported devices. Under **Settings > Low battery alarms**, toggle the warning sound for each detected device. An enabled alarm sounds once when that device reaches 10% or less, and rearms after it rises above 10%.
 
 The latest battery level is saved per device. If the mouse sleeps or stops responding while its receiver is still connected, the tray shows the last known percentage and marks it as stale.
@@ -66,6 +68,28 @@ Linux saves alarm settings under `$XDG_CONFIG_HOME/peripheral-battery-monitor`, 
 
 Current support is ScyRox VID `3554`, wireless products `F5F4`, `F5F7`, and `F517`. Wired models do not report battery. If no supported receiver is available or the mouse is asleep, the tray tooltip reports the current state.
 
-The app reads report ID 8, command 3 for receiver online state, and command 4 for battery level and charging state. It displays the raw level reported by the receiver; ScyRox's official app applies voltage-based conversion and smoothing, so the displayed percentage can differ. The app sends read commands only and does not modify mouse settings.
+The app reads report ID 8, command 3 for receiver online state, and command 4 for battery level and charging state.
+
+When valid voltage is available, the app estimates percentage using ScyRox S-Center's voltage curve. A rolling 60-second median rejects isolated spikes, followed by a 30-second exponential filter. During discharge the displayed percentage can fall by one point every 30 seconds and does not rise with voltage rebounds. Charging can raise it at the same rate. Receiver warnings at 15% or below override smoothing. Missing or implausible voltage uses the receiver's percentage as the target.
+
+The display stays below 100% until eight full-charge reports span at least 35 seconds without gaps over 15 seconds. After unplugging, it holds the displayed level for two minutes while voltage settles, unless the receiver reports a low battery. Sleeping/offline replies retain the cached level and do not advance the estimator or calibration. Gaps over two minutes reset filtering and charging confirmation; gaps over 30 minutes allow a fresh estimate rather than retaining an obsolete percentage.
+
+Estimator history is saved separately from the existing battery cache. Windows stores it as `EstimatorHistory` in each hashed device's cache key under `HKCU\Software\PeripheralBatteryMonitor`. Linux stores versioned `.history` files in the measurement directory below. Invalid or future-dated history is ignored. Compatible legacy caches can seed the first estimate, but a different charging state or a discrepancy over 15 points uses a fresh estimate.
+
+## Battery calibration measurements
+
+The app records live samples locally every 30 seconds and at charging/full-state transitions. CSV columns contain Unix time, receiver percentage, measured and filtered millivolts, target and displayed percentages, charging state, and confirmed-full state. Filenames use hashed device identities and contain no serials or HID paths. Windows uses `%LOCALAPPDATA%\PeripheralBatteryMonitor\battery-measurements`; Linux uses `$XDG_STATE_HOME/peripheral-battery-monitor/battery-measurements`, defaulting to `~/.local/state/peripheral-battery-monitor/battery-measurements`. Each device keeps a current CSV and one rotated CSV, each approximately 2 MB. No measurements are uploaded.
+
+Run this command to inspect calibration progress without starting the tray, accessing HID, or checking for updates:
+
+```sh
+peripheral-battery-monitor --battery-report
+```
+
+The report counts recorded samples and full-to-low cycles. A cycle starts after a confirmed full charge and unplugging, and ends when the receiver reports 5% or less. Only cycles with at least ten minutes, twenty samples, valid voltage throughout, and no gaps over two minutes are used for comparisons. The report compares voltage targets and displayed percentages against remaining wall-clock runtime to the low-battery endpoint. This is a runtime reference, not measured charge capacity. Sleep/disconnection gaps exclude a cycle from comparisons.
+
+Use the mouse normally across several charge cycles with comparable polling rates and workloads. The samples support checking and adjusting the curve later; the app does not automatically change it from incomplete data or treat the receiver's coarse percentage as ground truth. Filtering improves stability, but neither 1% steps nor runtime comparisons establish 1% charge accuracy.
+
+The app sends read commands only and does not modify mouse settings.
 
 On Windows, the startup toggle writes a per-user Windows startup entry that points to the executable's current path. Windows alarm settings and battery cache stay under `HKCU\Software\PeripheralBatteryMonitor`. On Linux, the autostart entry also points to the current executable. Keep the executable in a stable folder; if you move it, turn startup off and back on to update the path. Avoid polling the same receiver with another app at the same time, as their HID requests may interfere.
