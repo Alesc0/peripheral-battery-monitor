@@ -1,4 +1,4 @@
-name: Build Windows portable executable
+name: Build and release
 
 on:
   push:
@@ -10,15 +10,19 @@ permissions:
 
 jobs:
   build:
-    name: Build x64 executable
+    name: Build Windows x64 executable
     runs-on: windows-latest
-
+    env:
+      PBM_BUILD_NUMBER: ${{ github.run_number }}
     steps:
       - name: Check out source
         uses: actions/checkout@v7
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc
 
       - name: Build portable executable
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
@@ -30,3 +34,61 @@ jobs:
           path: target/x86_64-pc-windows-msvc/release/peripheral-battery-monitor.exe
           if-no-files-found: error
           retention-days: 90
+
+  linux:
+    name: Build Linux
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      build_number: ${{ github.run_number }}
+
+  release:
+    name: Publish release
+    if: github.ref == 'refs/heads/main'
+    needs: [build, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: build-${{ github.run_number }}
+      RELEASE_COMMIT: ${{ github.sha }}
+    steps:
+      - name: Download Windows executable
+        uses: actions/download-artifact@v8
+        with:
+          name: peripheral-battery-monitor-windows-x64
+          path: release
+
+      - name: Download Linux executable and receiver permission rules
+        uses: actions/download-artifact@v8
+        with:
+          name: peripheral-battery-monitor-linux-x64
+          path: linux
+
+      - name: Package Linux release
+        run: |
+          install -m755 linux/peripheral-battery-monitor release/peripheral-battery-monitor-linux-x64
+          chmod +x linux/peripheral-battery-monitor
+          tar -czf release/peripheral-battery-monitor-linux-x64.tar.gz -C linux .
+
+      - name: Create release with both builds
+        run: |
+          if [[ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null)" == false ]]; then
+            echo "Release $RELEASE_TAG already exists; keeping its published assets."
+            exit 0
+          fi
+          # Publish only after both assets have been uploaded. A failed draft can
+          # be retried without exposing an incomplete release to update checks.
+          if ! gh release create "$RELEASE_TAG" release/* \
+            --target "$RELEASE_COMMIT" --title "Build ${{ github.run_number }}" \
+            --generate-notes --draft; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+          fi
+          # A slower, older run must not replace a newer build as latest.
+          latest_tag=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null || true)
+          latest=false
+          if [[ ! "$latest_tag" =~ ^build-([0-9]+)$ ]] || (( BASH_REMATCH[1] < ${{ github.run_number }} )); then
+            latest=true
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest="$latest"

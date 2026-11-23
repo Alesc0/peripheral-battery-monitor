@@ -54,7 +54,13 @@ type UiEventSender = EventLoopProxy<UiEvent>;
 #[cfg(target_os = "linux")]
 type UiEventSender = Sender<UiEvent>;
 
+mod battery;
+mod calibration;
+mod updates;
+
 enum UiEvent {
+    UpdateReady(updates::PreparedUpdate),
+    UpdateStatus(String),
     Batteries(Result<Vec<Battery>, String>),
 }
 
@@ -70,12 +76,12 @@ struct Battery {
     is_stale: bool,
 }
 
-mod battery;
-mod calibration;
-
 fn main() -> Result<(), Box<dyn Error>> {
     if std::env::args().nth(1).as_deref() == Some("--battery-report") {
         calibration::report()?;
+        return Ok(());
+    }
+    if updates::handle_helper_mode()? {
         return Ok(());
     }
     let executable = std::env::current_exe()
@@ -95,7 +101,8 @@ fn run_app() -> Result<(), Box<dyn Error>> {
         .name("peripheral-battery-poll".into())
         .spawn(move || poll_worker(proxy, command_rx))?;
 
-    let mut app = TrayApp::new(command_tx);
+    let update_tx = updates::start_worker(event_loop.create_proxy())?;
+    let mut app = TrayApp::new(command_tx, update_tx);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -106,6 +113,11 @@ struct TrayApp {
     status_item: Option<MenuItem>,
     refresh_item: Option<MenuItem>,
     startup_item: Option<CheckMenuItem>,
+    automatic_updates_item: Option<CheckMenuItem>,
+    update_status_item: Option<MenuItem>,
+    update_status: String,
+    exit_requested: bool,
+    update_tx: Sender<bool>,
     alarm_submenu: Option<Submenu>,
     alarm_items: HashMap<String, CheckMenuItem>,
     low_battery_alarm_fired: HashSet<String>,
@@ -114,13 +126,23 @@ struct TrayApp {
 }
 
 impl TrayApp {
-    fn new(command_tx: Sender<Command>) -> Self {
+    fn new(command_tx: Sender<Command>, update_tx: Sender<bool>) -> Self {
         Self {
             command_tx,
             tray: None,
             status_item: None,
             refresh_item: None,
             startup_item: None,
+            automatic_updates_item: None,
+            update_status_item: None,
+            update_status: if updates::enabled() {
+                "Updates not checked yet"
+            } else {
+                "Automatic updates disabled"
+            }
+            .into(),
+            exit_requested: false,
+            update_tx,
             alarm_submenu: None,
             alarm_items: HashMap::new(),
             low_battery_alarm_fired: HashSet::new(),
@@ -153,9 +175,18 @@ impl TrayApp {
             None,
         );
         let alarms = Submenu::new("Low battery alarms", true);
-        let settings = Submenu::with_items("Settings", true, &[&startup, &alarms])?;
+        let automatic_updates = CheckMenuItem::with_id(
+            "automatic-updates",
+            "Automatically install updates",
+            true,
+            updates::enabled(),
+            None,
+        );
+        let update_status = MenuItem::with_id("update-status", &self.update_status, false, None);
+        let settings =
+            Submenu::with_items("Settings", true, &[&startup, &automatic_updates, &alarms])?;
         let quit = MenuItem::with_id("quit-app", "Quit", true, None);
-        let menu = Menu::with_items(&[&status, &refresh, &settings, &quit])?;
+        let menu = Menu::with_items(&[&status, &refresh, &update_status, &settings, &quit])?;
         let tray = TrayIconBuilder::new()
             .with_tooltip("Peripheral Battery: searching…")
             .with_icon(draw_battery_icon(None))
@@ -168,6 +199,8 @@ impl TrayApp {
         self.status_item = Some(status);
         self.refresh_item = Some(refresh);
         self.startup_item = Some(startup);
+        self.automatic_updates_item = Some(automatic_updates);
+        self.update_status_item = Some(update_status);
         self.alarm_submenu = Some(alarms);
         self.quit_item = Some(quit);
         self.tray = Some(tray);
@@ -288,9 +321,10 @@ impl ApplicationHandler<UiEvent> for TrayApp {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UiEvent) {
-        match event {
-            UiEvent::Batteries(result) => self.show_state(result),
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UiEvent) {
+        self.handle_ui_event(event);
+        if self.exit_requested {
+            event_loop.exit();
         }
     }
 
@@ -305,6 +339,42 @@ impl ApplicationHandler<UiEvent> for TrayApp {
 }
 
 impl TrayApp {
+    fn set_update_status(&mut self, text: String) {
+        self.update_status = text;
+        if let Some(item) = &self.update_status_item {
+            item.set_text(&self.update_status);
+        }
+    }
+
+    fn handle_ui_event(&mut self, event: UiEvent) {
+        match event {
+            UiEvent::Batteries(result) => self.show_state(result),
+            UiEvent::UpdateStatus(text) => {
+                if updates::enabled() {
+                    self.set_update_status(text);
+                }
+            }
+            UiEvent::UpdateReady(update) => {
+                // Apply queued menu clicks before deciding whether to install.
+                if self.handle_menu_events() {
+                    self.exit_requested = true;
+                    return;
+                }
+                // Recheck on the UI thread so a disabled toggle discards staged downloads.
+                if !updates::enabled() {
+                    return;
+                }
+                match update.install_and_restart() {
+                    Ok(()) => self.exit_requested = true,
+                    Err(error) => {
+                        log_diagnostic(&format!("could not install update: {error}"));
+                        self.set_update_status("Update failed; will retry later".into());
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_menu_events(&mut self) -> bool {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if self
@@ -313,6 +383,30 @@ impl TrayApp {
                 .is_some_and(|item| event.id == item.id())
             {
                 let _ = self.command_tx.send(Command::Refresh);
+            } else if self
+                .automatic_updates_item
+                .as_ref()
+                .is_some_and(|item| event.id == item.id())
+            {
+                if let Some(item) = &self.automatic_updates_item {
+                    let enabled = item.is_checked();
+                    if let Err(error) = updates::set_enabled(enabled) {
+                        item.set_checked(!enabled);
+                        log_diagnostic(&format!(
+                            "could not save automatic update setting: {error}"
+                        ));
+                        if let Some(status) = &self.status_item {
+                            status.set_text(format!("Could not save update setting: {error}"));
+                        }
+                    } else {
+                        let _ = self.update_tx.send(enabled);
+                        self.set_update_status(if enabled {
+                            "Checking for updates…".into()
+                        } else {
+                            "Automatic updates disabled".into()
+                        });
+                    }
+                }
             } else if self
                 .startup_item
                 .as_ref()
@@ -352,7 +446,7 @@ impl TrayApp {
                 return true;
             }
         }
-        false
+        self.exit_requested
     }
 }
 

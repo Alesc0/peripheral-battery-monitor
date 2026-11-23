@@ -1,8 +1,11 @@
 name: Build Linux executable
 
 on:
-  push:
-    branches: [main]
+  workflow_call:
+    inputs:
+      build_number:
+        required: true
+        type: string
   workflow_dispatch:
 
 permissions:
@@ -12,6 +15,8 @@ jobs:
   build:
     name: Build Linux x64 executable
     runs-on: ubuntu-24.04
+    env:
+      PBM_BUILD_NUMBER: ${{ inputs.build_number }}
 
     steps:
       - name: Check out source
@@ -24,6 +29,9 @@ jobs:
 
       - name: Install Linux build dependencies
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libudev-dev libxdo-dev
+
+      - name: Run tests
+        run: cargo test --locked
 
       - name: Build executable
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu

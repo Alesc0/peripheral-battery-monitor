@@ -6,6 +6,10 @@ description = "Windows and Linux system tray battery monitor for supported perip
 
 [dependencies]
 getrandom = "0.3"
+sha2 = "0.10"
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+ureq = { version = "3.4", features = ["json"] }
 tray-icon = { version = "0.26.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]

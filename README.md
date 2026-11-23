@@ -14,14 +14,26 @@ Click the tray icon to see the connected device name, battery percentage, and ch
 
 ## Download a build
 
-Every push to `main` builds Windows x64 and Linux x64 executables. To download one:
+Every push to `main` builds Windows x64 and Linux x64 executables and publishes a GitHub release once both builds succeed. Releases use increasing tags such as `build-42` and include generated release notes.
 
-1. Open the repository's **Actions** tab.
-2. Open the latest successful **Build Windows portable executable** or **Build Linux executable** run.
-3. Download `peripheral-battery-monitor-windows-x64` or `peripheral-battery-monitor-linux-x64` and extract it.
-4. On Windows, run `peripheral-battery-monitor.exe`. For Linux, follow the setup below and run `chmod +x` on the extracted executable.
+Download the latest build from [Releases](https://github.com/Alesc0/peripheral-battery-monitor/releases/latest):
 
-The Windows executable statically links the MSVC C runtime, so it does not require a separate Visual C++ Redistributable installer. It is a standalone `.exe`, not an installer. The workflow artifact is retained for 90 days.
+- Windows: download and run `peripheral-battery-monitor.exe`.
+- Linux: download and extract `peripheral-battery-monitor-linux-x64.tar.gz`, then follow the setup below. The archive includes the receiver permission rules.
+
+The Windows executable statically links the MSVC C runtime, so it does not require a separate Visual C++ Redistributable installer. It is a standalone `.exe`, not an installer. The **Build and release** workflow also keeps downloadable build artifacts for 90 days.
+
+## Automatic updates
+
+Automatic updates are enabled by default on Windows and Linux. The app checks GitHub Releases at startup and every six hours while running. Use **Settings > Automatically install updates** to turn them off or on. Turning them on starts a check immediately.
+
+When a newer build is available, the app downloads the executable, verifies its size and SHA-256 digest against GitHub's release metadata, replaces the executable at its current path, and restarts automatically. Settings, battery cache, and startup entries are preserved. The tray menu shows update progress or a failure message. Checks and downloads run separately from battery polling and do not require a GitHub login.
+
+Keep the app in a folder your account can write to. Updates never request administrator access. On Windows, a temporary helper waits for the app to exit before replacing it. On Linux, the replacement uses an atomic rename. If the replacement cannot launch, the updater attempts to restore the previous executable. Failures are recorded in the diagnostic log and retried at the next scheduled check.
+
+Turning updates off cancels an in-progress download and discards any staged update that has not started installing. Release builds compare their embedded build number with the latest release. Local builds without a build number update to the latest published build too.
+
+Windows saves the toggle as `AutomaticUpdates` under `HKCU\Software\PeripheralBatteryMonitor`. Linux saves it in `automatic-updates` under the app's configuration directory. Releases include a raw `peripheral-battery-monitor-linux-x64` executable for the updater as well as the Linux archive for manual installation. Receiver permission rules still require the one-time installation below.
 
 ## Build on Windows
 
@@ -60,7 +72,7 @@ cargo build --release --locked --target x86_64-unknown-linux-gnu
 ./target/x86_64-unknown-linux-gnu/release/peripheral-battery-monitor
 ```
 
-The downloaded Linux artifact contains the executable and `packaging/70-peripheral-battery-monitor.rules`. Run the install command from the extracted artifact folder. The CI build runs on Ubuntu 24.04 and dynamically links system libraries; it requires glibc 2.39 or newer and the runtime packages listed above. CachyOS can also build directly from source with its installed libraries.
+The downloaded Linux artifact contains the executable and `packaging/70-peripheral-battery-monitor.rules`. Run the install command from the extracted archive or artifact folder. The CI build runs on Ubuntu 24.04 and dynamically links system libraries; it requires glibc 2.39 or newer and the runtime packages listed above. CachyOS can also build directly from source with its installed libraries.
 
 Linux saves alarm settings under `$XDG_CONFIG_HOME/peripheral-battery-monitor`, defaulting to `~/.config/peripheral-battery-monitor`. Battery cache and diagnostics go under `$XDG_STATE_HOME/peripheral-battery-monitor`, defaulting to `~/.local/state/peripheral-battery-monitor`. Per-device filenames use hashed identities rather than raw HID serials or paths. **Start at login** creates `$XDG_CONFIG_HOME/autostart/peripheral-battery-monitor.desktop`, defaulting to `~/.config/autostart/peripheral-battery-monitor.desktop`.
 

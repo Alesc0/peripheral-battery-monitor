@@ -5,7 +5,8 @@ pub(super) fn run_app() -> Result<(), Box<dyn Error>> {
     gtk::init()?;
     let (ui_tx, ui_rx) = mpsc::channel();
     let (command_tx, command_rx) = mpsc::channel();
-    let mut app = TrayApp::new(command_tx);
+    let update_tx = updates::start_worker(ui_tx.clone())?;
+    let mut app = TrayApp::new(command_tx, update_tx);
     app.create_tray()?;
     thread::Builder::new()
         .name("peripheral-battery-poll".into())
@@ -13,8 +14,11 @@ pub(super) fn run_app() -> Result<(), Box<dyn Error>> {
 
     // GTK owns the tray and menus. Only the polling worker touches HID.
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        while let Ok(UiEvent::Batteries(result)) = ui_rx.try_recv() {
-            app.show_state(result);
+        while let Ok(event) = ui_rx.try_recv() {
+            app.handle_ui_event(event);
+            if app.exit_requested {
+                break;
+            }
         }
         if app.handle_menu_events() {
             gtk::main_quit();
@@ -45,7 +49,7 @@ fn xdg_directory(variable: &str, fallback: &str) -> std::io::Result<PathBuf> {
         })
 }
 
-fn config_directory() -> std::io::Result<PathBuf> {
+pub(super) fn config_directory() -> std::io::Result<PathBuf> {
     Ok(xdg_directory("XDG_CONFIG_HOME", ".config")?.join("peripheral-battery-monitor"))
 }
 
