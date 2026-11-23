@@ -806,6 +806,9 @@ fn log_diagnostic(message: &str) {
 
 fn draw_battery_icon(level: Option<u8>) -> Icon {
     const SIZE: usize = 32;
+    const SCALE: usize = 2;
+    const GLYPH_HEIGHT: usize = 12;
+    const GLYPH_GAP: usize = 1;
     let mut pixels = vec![0u8; SIZE * SIZE * 4];
     let fill = match level {
         Some(value) if value <= 15 => [237, 91, 91, 255],
@@ -814,39 +817,27 @@ fn draw_battery_icon(level: Option<u8>) -> Icon {
         None => [112, 116, 126, 255],
     };
 
-    // Compact bitmap lettering keeps the percentage readable without a font dependency.
-    // Three digits plus the percent sign fit even at 100%.
-    let text = level.map_or_else(|| "--".to_owned(), |value| format!("{value}%"));
-    const SCALE_X: usize = 2;
-    const SCALE_Y: usize = 4;
-    let text_width = (text.len() * 4 - 1) * SCALE_X;
-    let left = (SIZE - text_width) / 2;
-    let top = (SIZE - 5 * SCALE_Y) / 2;
-    for (index, character) in text.chars().enumerate() {
-        let rows = match character {
-            '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
-            '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
-            '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
-            '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
-            '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
-            '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
-            '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
-            '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
-            '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
-            '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
-            '%' => [0b101, 0b001, 0b010, 0b100, 0b101],
-            _ => [0, 0, 0b111, 0, 0],
-        };
+    let label = level.map_or_else(|| "--".to_owned(), |value| value.min(100).to_string());
+    let full_charge = label == "100";
+    let glyphs = label
+        .chars()
+        .map(|character| battery_glyph(character, full_charge));
+    let text_width =
+        glyphs.clone().map(|(width, _)| width).sum::<usize>() + (label.len() - 1) * GLYPH_GAP;
+    // Center on the 16px grid so the glyphs stay crisp at half size.
+    let mut left = ((SIZE / SCALE - text_width) / 2) * SCALE;
+    let top = ((SIZE / SCALE - GLYPH_HEIGHT) / 2) * SCALE;
+    for (width, rows) in glyphs {
         for (row, bits) in rows.iter().enumerate() {
-            for column in 0..3 {
-                if bits & (1 << (2 - column)) != 0 {
-                    for dy in 0..SCALE_Y {
-                        for dx in 0..SCALE_X {
+            for column in 0..width {
+                if bits & (1 << (width - 1 - column)) != 0 {
+                    for dy in 0..SCALE {
+                        for dx in 0..SCALE {
                             pixel(
                                 &mut pixels,
                                 SIZE,
-                                left + index * 4 * SCALE_X + column * SCALE_X + dx,
-                                top + row * SCALE_Y + dy,
+                                left + column * SCALE + dx,
+                                top + row * SCALE + dy,
                                 fill,
                             );
                         }
@@ -854,9 +845,93 @@ fn draw_battery_icon(level: Option<u8>) -> Icon {
                 }
             }
         }
+        left += (width + GLYPH_GAP) * SCALE;
     }
 
     Icon::from_rgba(pixels, SIZE as u32, SIZE as u32).expect("valid 32x32 icon")
+}
+
+fn battery_glyph(character: char, full_charge: bool) -> (usize, [u8; 12]) {
+    match character {
+        '0' => (
+            6,
+            [
+                0b011110, 0b111111, 0b110011, 0b110011, 0b110011, 0b110011, 0b110011, 0b110011,
+                0b110011, 0b110011, 0b111111, 0b011110,
+            ],
+        ),
+        // A narrower 1 gives both zeros room at full charge.
+        '1' if full_charge => (
+            2,
+            [
+                0b01, 0b11, 0b11, 0b01, 0b01, 0b01, 0b01, 0b01, 0b01, 0b01, 0b11, 0b11,
+            ],
+        ),
+        '1' => (
+            4,
+            [
+                0b0110, 0b1110, 0b1110, 0b0110, 0b0110, 0b0110, 0b0110, 0b0110, 0b0110, 0b0110,
+                0b1111, 0b1111,
+            ],
+        ),
+        '2' => (
+            6,
+            [
+                0b011110, 0b111111, 0b110011, 0b000011, 0b000011, 0b000110, 0b001100, 0b011000,
+                0b110000, 0b110000, 0b111111, 0b111111,
+            ],
+        ),
+        '3' => (
+            6,
+            [
+                0b011110, 0b111111, 0b110011, 0b000011, 0b000011, 0b001110, 0b001110, 0b000011,
+                0b000011, 0b110011, 0b111111, 0b011110,
+            ],
+        ),
+        '4' => (
+            6,
+            [
+                0b000110, 0b001110, 0b001110, 0b011110, 0b010110, 0b110110, 0b110110, 0b111111,
+                0b111111, 0b000110, 0b000110, 0b000110,
+            ],
+        ),
+        '5' => (
+            6,
+            [
+                0b111111, 0b111111, 0b110000, 0b110000, 0b110000, 0b111110, 0b111111, 0b000011,
+                0b000011, 0b110011, 0b111111, 0b011110,
+            ],
+        ),
+        '6' => (
+            6,
+            [
+                0b011110, 0b111111, 0b110000, 0b110000, 0b110000, 0b111110, 0b111111, 0b110011,
+                0b110011, 0b110011, 0b111111, 0b011110,
+            ],
+        ),
+        '7' => (
+            6,
+            [
+                0b111111, 0b111111, 0b000011, 0b000011, 0b000110, 0b000110, 0b001100, 0b001100,
+                0b011000, 0b011000, 0b011000, 0b011000,
+            ],
+        ),
+        '8' => (
+            6,
+            [
+                0b011110, 0b111111, 0b110011, 0b110011, 0b110011, 0b011110, 0b011110, 0b110011,
+                0b110011, 0b110011, 0b111111, 0b011110,
+            ],
+        ),
+        '9' => (
+            6,
+            [
+                0b011110, 0b111111, 0b110011, 0b110011, 0b110011, 0b111111, 0b011111, 0b000011,
+                0b000011, 0b000011, 0b111111, 0b011110,
+            ],
+        ),
+        _ => (5, [0, 0, 0, 0, 0, 0b11111, 0b11111, 0, 0, 0, 0, 0]),
+    }
 }
 
 fn pixel(pixels: &mut [u8], width: usize, x: usize, y: usize, color: [u8; 4]) {

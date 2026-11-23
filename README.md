@@ -2,7 +2,7 @@
 
 Peripheral Battery Monitor is a small Windows and Linux system tray app for checking peripheral battery levels. It currently supports ScyRox wireless mice.
 
-The tray displays the battery percentage directly, using the lowest level when multiple devices are connected. It shows `--` when no battery reading is available. Green, amber, and red text indicate normal, low, and very low battery levels.
+The tray icon shows the battery level as a number, such as `89` for 89%. It uses the lowest level when multiple devices are connected and shows `--` when no reading is available. Green, amber, and red text indicate normal, low, and very low battery levels.
 
 The app can poll multiple supported devices. Under **Settings > Low battery alarms**, toggle the warning sound for each detected device. An enabled alarm sounds once when that device reaches 10% or less, and rearms after it rises above 10%.
 
